@@ -15,10 +15,26 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from core_stock import (
-    DEFAULT_STOCK_POOL, STRATEGY_LEVELS,
+    STRATEGY_LEVELS,
     StrategyParams, StockDataFetcher, MomentumScreener,
-    scan_disposal_ma20,
+    FullMarketFetcher, scan_disposal_ma20,
 )
+from datetime import datetime
+
+
+# ---- 全市場資料載入 (快取: 同一天同參數只抓一次) ----
+@st.cache_data(show_spinner=False, ttl=6 * 3600, max_entries=3)
+def load_market_data(period: str, date_key: str, min_lots: int,
+                     _pcb=None):
+    stocks, data_date = FullMarketFetcher.fetch_stock_list(
+        min_today_lots=min_lots)
+    if not stocks:
+        return {}, {}, None
+    codes = [s["code"] for s in stocks]
+    names = {s["code"]: s["name"] for s in stocks}
+    frames = FullMarketFetcher.batch_download(codes, period=period,
+                                              progress_cb=_pcb)
+    return frames, names, data_date
 
 st.set_page_config(page_title="台股飆股篩選", page_icon="🎯",
                    layout="wide", initial_sidebar_state="collapsed")
@@ -186,18 +202,44 @@ with tab_screener:
     desc = {v[0]: v[2] for v in STRATEGY_LEVELS}[level]
     st.caption(f"💡 {desc}")
 
-    if st.button("🔍 開始掃描 (30 檔)", type="primary",
+    st.caption("🌐 掃描範圍: 全市場上市普通股 (~900 檔)  |  "
+               "首次約 2~4 分鐘, 同日再掃只需幾秒 (當日快取)")
+    if level == "strict":
+        st.warning("⚠️ Strict 要抓 2 年資料, 首次會比較久 (~5 分鐘)")
+
+    if st.button("🔍 開始掃描 (全市場)", type="primary",
                  use_container_width=True, key="scan_btn"):
         prog = st.progress(0, text="準備中...")
-        def _cb(i, total, label):
-            prog.progress(i / total, text=f"掃描中 ({i}/{total}) {label}")
-        st.session_state.screener_hits = MomentumScreener.scan_pool(
-            level=level, progress_cb=_cb)
+        if True:
+            # 全市場: Stage1 清單 → Stage2 批次下載 (快取) → Stage3 本地掃描
+            p_now = StrategyParams.get()
+            pre_lots = max(100, int(p_now["min_vol_lots"]) // 3)
+            period = "2y" if level == "strict" else "6mo"
+            date_key = datetime.now().strftime("%Y-%m-%d")
+            prog.progress(0.02, text="Stage 1/3: 抓全市場股票清單...")
+            def _dl_cb(i, total, label):
+                prog.progress(0.05 + 0.55 * i / max(total, 1),
+                              text=f"Stage 2/3: {label}")
+            frames, names, data_date = load_market_data(
+                period, date_key, pre_lots, _pcb=_dl_cb)
+            if not frames:
+                st.error(f"抓取全市場清單失敗: "
+                         f"{FullMarketFetcher.get_last_error()}")
+                st.session_state.screener_hits = []
+            else:
+                def _scan_cb(i, total, label):
+                    prog.progress(0.60 + 0.40 * i / max(total, 1),
+                                  text=f"Stage 3/3: 篩選中 ({i}/{total}) {label}")
+                st.session_state.screener_hits = MomentumScreener.scan_frames(
+                    frames, names, level=level, progress_cb=_scan_cb)
+                st.session_state.market_info = (len(frames), data_date)
         prog.empty()
 
     hits = st.session_state.get("screener_hits", [])
     if hits:
-        st.success(f"✅ 找到 {len(hits)} 檔")
+        mi = st.session_state.get("market_info")
+        extra = f"  |  全市場掃了 {mi[0]} 檔 (資料日 {mi[1]})" if mi else ""
+        st.success(f"✅ 找到 {len(hits)} 檔{extra}")
         # ------- 左表右圖 -------
         col_l, col_r = st.columns([2, 3])
         with col_l:
