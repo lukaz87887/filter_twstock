@@ -1,0 +1,286 @@
+# -*- coding: utf-8 -*-
+"""
+streamlit_app.py v2 — 台股飆股篩選 Web App
+
+v2 版面改動 (依使用者需求):
+  1. ⚙️ 參數設定: 三種預設組一鍵切換 (保守/標準/寬鬆) + 進階微調
+  2. 🎯 即時飆股篩選: 六種策略齊全 + 左表右圖 (點列即看 K 線)
+  3. 🚨 處置股+月線: 左表右圖
+
+執行:  streamlit run streamlit_app.py
+"""
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from core_stock import (
+    DEFAULT_STOCK_POOL, STRATEGY_LEVELS,
+    StrategyParams, StockDataFetcher, MomentumScreener,
+    scan_disposal_ma20,
+)
+
+st.set_page_config(page_title="台股飆股篩選", page_icon="🎯",
+                   layout="wide", initial_sidebar_state="collapsed")
+
+# ---- CSS: 左右欄在手機上也不換行 (保持左右分割) ----
+st.markdown("""
+<style>
+/* 平板/桌機/手機橫向 (>=768px): 強制左右並排不換行 */
+@media (min-width: 768px) {
+  [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: .6rem; }
+  [data-testid="stHorizontalBlock"] > div { min-width: 0 !important; }
+}
+/* 手機直向 (<768px): 用預設堆疊, 表格在上 K 線在下, 各自全寬 */
+div[data-testid="stDataFrame"] { font-size: 0.85rem; }
+/* 縮小手機上的邊距 */
+@media (max-width: 767px) {
+  .block-container { padding-left: 0.6rem; padding-right: 0.6rem; }
+}
+</style>""", unsafe_allow_html=True)
+
+st.title("🎯 台股飆股篩選")
+
+# ================= session state 初始化 =================
+if "preset" not in st.session_state:
+    st.session_state.preset = "standard"
+    StrategyParams.apply_preset("standard")
+if "adv_params" not in st.session_state:
+    st.session_state.adv_params = StrategyParams.get()
+
+# 每次 rerun 都把 session 的參數灌回 StrategyParams (Streamlit 是多次執行模型)
+StrategyParams.set_batch(st.session_state.adv_params)
+
+
+# ================= Plotly K 線 =================
+def plot_candlestick(ticker: str, name: str, note: str = "",
+                     ma20_only: bool = False, disposal: dict = None):
+    df = StockDataFetcher.fetch_history(ticker, period="6mo")
+    if df.empty:
+        st.error(f"無法取得 {ticker} 股價資料")
+        return
+    p = df.tail(120).copy()
+    p["MA5"] = df["Close"].rolling(5).mean().loc[p.index]
+    p["MA20"] = df["Close"].rolling(20).mean().loc[p.index]
+    p["MA60"] = df["Close"].rolling(60).mean().loc[p.index]
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.75, 0.25], vertical_spacing=0.03)
+    fig.add_trace(go.Candlestick(
+        x=p.index, open=p["Open"], high=p["High"],
+        low=p["Low"], close=p["Close"],
+        increasing_line_color="#C62828", increasing_fillcolor="#C62828",
+        decreasing_line_color="#2E7D32", decreasing_fillcolor="#2E7D32",
+        name="K線"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=p.index, y=p["MA20"],
+                             line=dict(color="#1E90FF", width=2),
+                             name="20MA 月線"), row=1, col=1)
+    if not ma20_only:
+        fig.add_trace(go.Scatter(x=p.index, y=p["MA5"],
+                                 line=dict(color="#FF8C00", width=1),
+                                 name="5MA"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=p.index, y=p["MA60"],
+                                 line=dict(color="#8B008B", width=1.2),
+                                 name="60MA"), row=1, col=1)
+    colors = ["#C62828" if c >= o else "#2E7D32"
+              for c, o in zip(p["Close"], p["Open"])]
+    fig.add_trace(go.Bar(x=p.index, y=p["Volume"] / 1000,
+                         marker_color=colors, name="量(張)"), row=2, col=1)
+
+    # 處置期間淡紅色帶
+    if disposal and disposal.get("disposal_start") and disposal.get("disposal_end"):
+        try:
+            fig.add_vrect(x0=disposal["disposal_start"],
+                          x1=disposal["disposal_end"],
+                          fillcolor="#FF6B6B", opacity=0.15, line_width=0,
+                          annotation_text="🚨 處置期間",
+                          annotation_position="top left",
+                          annotation_font_color="#C62828", row=1, col=1)
+        except Exception:
+            pass
+
+    code = ticker.replace(".TW", "")
+    fig.update_layout(
+        title=f"{name} ({code})  {note}",
+        xaxis_rangeslider_visible=False, height=560,
+        margin=dict(l=8, r=8, t=48, b=8),
+        legend=dict(orientation="h", y=1.02, x=0),
+        hovermode="x unified")
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ================= 三分頁 =================
+tab_params, tab_screener, tab_disposal = st.tabs(
+    ["⚙️ 參數設定", "🎯 即時飆股篩選", "🚨 處置股+月線"])
+
+# ============ Tab 1: 參數設定 (三種預設) ============
+with tab_params:
+    st.subheader("⚙️ 參數設定")
+    st.caption("跟桌面版一樣: 三種預設組一鍵切換, 或展開進階微調")
+
+    c1, c2, c3 = st.columns(3)
+    def _apply(preset):
+        st.session_state.preset = preset
+        st.session_state.adv_params = StrategyParams.apply_preset(preset)
+
+    with c1:
+        st.button("🛡️ 保守\n訊號少 品質高", use_container_width=True,
+                  type="primary" if st.session_state.preset == "conservative" else "secondary",
+                  on_click=_apply, args=("conservative",))
+    with c2:
+        st.button("⚖️ 標準\n平衡預設", use_container_width=True,
+                  type="primary" if st.session_state.preset == "standard" else "secondary",
+                  on_click=_apply, args=("standard",))
+    with c3:
+        st.button("🔥 寬鬆\n訊號多 廣撒網", use_container_width=True,
+                  type="primary" if st.session_state.preset == "aggressive" else "secondary",
+                  on_click=_apply, args=("aggressive",))
+
+    st.success(f"目前套用: {StrategyParams.PRESET_LABELS[st.session_state.preset]}")
+
+    # 主要參數一覽
+    pv = st.session_state.adv_params
+    st.dataframe(pd.DataFrame([
+        {"參數": "量能放大倍數", "值": pv["vol_multiplier"]},
+        {"參數": "最小20日均量(張)", "值": pv["min_vol_lots"]},
+        {"參數": "突破回看天數", "值": pv["breakout_window"]},
+        {"參數": "RSI 區間", "值": f"{pv['rsi_min']} ~ {pv['rsi_max']}"},
+        {"參數": "MACD 必須為正", "值": "是" if pv["require_macd_positive"] else "否"},
+        {"參數": "離50MA上限%", "值": pv["max_extension_pct"]},
+        {"參數": "通道最短長度", "值": pv["channel_min_len"]},
+        {"參數": "抗跌最少次數", "值": pv["rs_min_count"]},
+        {"參數": "RS Rating 門檻", "值": pv["rs_rating_min"]},
+    ]), use_container_width=True, hide_index=True)
+
+    with st.expander("🔧 進階微調 (改完自動生效)"):
+        a1, a2 = st.columns(2)
+        with a1:
+            pv["vol_multiplier"] = st.slider("量能放大倍數", 1.0, 5.0,
+                                             float(pv["vol_multiplier"]), 0.1)
+            pv["min_vol_lots"] = st.number_input("最小20日均量(張)", 50, 10000,
+                                                 int(pv["min_vol_lots"]), 50)
+            pv["breakout_window"] = st.slider("突破回看天數", 10, 60,
+                                              int(pv["breakout_window"]), 5)
+            pv["max_extension_pct"] = st.slider("離50MA上限%", 5, 50,
+                                                int(pv["max_extension_pct"]), 5)
+        with a2:
+            pv["rsi_min"], pv["rsi_max"] = st.slider(
+                "RSI 區間", 0, 100,
+                (int(pv["rsi_min"]), int(pv["rsi_max"])), 1)
+            pv["require_macd_positive"] = st.checkbox(
+                "MACD 柱狀體必須為正", value=bool(pv["require_macd_positive"]))
+            pv["rs_min_count"] = st.slider("抗跌最少次數", 1, 10,
+                                           int(pv["rs_min_count"]), 1)
+            pv["rs_rating_min"] = st.slider("RS Rating 門檻", 0, 100,
+                                            int(pv["rs_rating_min"]), 5)
+        st.session_state.adv_params = pv
+        StrategyParams.set_batch(pv)
+
+
+# ============ Tab 2: 即時飆股篩選 (六策略 + 左表右圖) ============
+with tab_screener:
+    level_labels = {v[0]: v[1] for v in STRATEGY_LEVELS}
+    level = st.radio("進場條件策略 (六種)",
+                     [v[0] for v in STRATEGY_LEVELS],
+                     format_func=lambda x: level_labels[x],
+                     index=0, key="scr_level")
+    desc = {v[0]: v[2] for v in STRATEGY_LEVELS}[level]
+    st.caption(f"💡 {desc}")
+
+    if st.button("🔍 開始掃描 (30 檔)", type="primary",
+                 use_container_width=True, key="scan_btn"):
+        prog = st.progress(0, text="準備中...")
+        def _cb(i, total, label):
+            prog.progress(i / total, text=f"掃描中 ({i}/{total}) {label}")
+        st.session_state.screener_hits = MomentumScreener.scan_pool(
+            level=level, progress_cb=_cb)
+        prog.empty()
+
+    hits = st.session_state.get("screener_hits", [])
+    if hits:
+        st.success(f"✅ 找到 {len(hits)} 檔")
+        # ------- 左表右圖 -------
+        col_l, col_r = st.columns([2, 3])
+        with col_l:
+            tbl = pd.DataFrame([{
+                "代碼": h["ticker"].replace(".TW", ""),
+                "名稱": h["name"],
+                "收盤": h["close"],
+                "量比": h["vol_ratio"],
+                "符合": h.get("matched", h["level"]),
+            } for h in hits])
+            event = st.dataframe(
+                tbl, use_container_width=True, hide_index=True,
+                on_select="rerun", selection_mode="single-row",
+                height=520, key="scr_table")
+        with col_r:
+            rows = event.selection.rows if event and event.selection else []
+            idx = rows[0] if rows else 0   # 沒點就先顯示第一名
+            h = hits[idx]
+            plot_candlestick(h["ticker"], h["name"],
+                             note=f"量比 {h['vol_ratio']}x  "
+                                  f"{h.get('matched','')}")
+        st.caption("👈 點左表任一列, 右側 K 線立即切換")
+    elif "screener_hits" in st.session_state:
+        st.warning("❗ 沒有符合條件的個股 — 可到「⚙️ 參數設定」切成 🔥 寬鬆再試")
+
+
+# ============ Tab 3: 處置股+月線 (左表右圖) ============
+with tab_disposal:
+    c1, c2 = st.columns(2)
+    with c1:
+        days_back = st.selectbox("查詢區間", [7, 14, 30, 60], index=2,
+                                 format_func=lambda x: f"最近 {x} 天")
+    with c2:
+        only_active = st.checkbox("只看處置仍生效中", value=True)
+
+    if st.button("🔍 抓取處置股 + 月線掃描", type="primary",
+                 use_container_width=True, key="disp_btn"):
+        prog = st.progress(0, text="抓取處置股清單...")
+        def _cb2(i, total, label):
+            prog.progress(i / max(total, 1),
+                          text=f"計算月線 ({i}/{total}) {label}")
+        st.session_state.disposal_results = scan_disposal_ma20(
+            days_back=days_back, only_active=only_active, progress_cb=_cb2)
+        prog.empty()
+
+    results = st.session_state.get("disposal_results", [])
+    if results:
+        st.success(f"✅ 共 {len(results)} 檔  (🔴 ≤2%  🟡 ≤5%  ⚪ >5%)")
+        col_l, col_r = st.columns([2, 3])
+        with col_l:
+            def _short(dstr):  # 2026-06-22 → 06/22
+                return dstr[5:].replace("-", "/") if dstr else "?"
+            tbl = pd.DataFrame([{
+                "": r["color"], "代碼": r["code"], "名稱": r["name"],
+                "現價": r["close"],
+                "距月線%": r["diff_pct"],
+                "處置期間": f"{_short(r['disposal']['disposal_start'])}"
+                            f"~{_short(r['disposal']['disposal_end'])}",
+                "狀態": "處置中" if r["disposal"]["is_active"] else "已結束",
+                "5日%": r["change_5d_pct"],
+                "措施": r["disposal"]["measure"],
+            } for r in results])
+            event = st.dataframe(
+                tbl, use_container_width=True, hide_index=True,
+                on_select="rerun", selection_mode="single-row",
+                height=420, key="disp_table")
+        with col_r:
+            rows = event.selection.rows if event and event.selection else []
+            idx = rows[0] if rows else 0
+            r = results[idx]
+            d = r["disposal"]
+            plot_candlestick(
+                f"{r['code']}.TW", r["name"],
+                note=f"距月線 {r['diff_pct']:+.1f}%",
+                ma20_only=True, disposal=d)
+            st.caption(f"🚨 處置 {d['disposal_start']} ~ {d['disposal_end']}  "
+                       f"({d['measure']})  "
+                       f"{'✅ 生效中' if d['is_active'] else '已結束'}")
+        st.caption("👈 點左表任一列, 右側 K 線立即切換")
+    elif "disposal_results" in st.session_state:
+        st.warning("❗ 沒有符合條件的處置股")
+
+st.divider()
+st.caption("📊 資料來源: Yahoo Finance / 證交所  |  僅供研究參考, 不構成投資建議")

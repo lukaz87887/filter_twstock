@@ -1,0 +1,613 @@
+# -*- coding: utf-8 -*-
+"""
+core_stock.py v2 — 台股篩選核心邏輯 (完整移植自桌面版 v9.4.2)
+
+v2 更新:
+  • StrategyParams: 三種預設組 (保守/標準/寬鬆), 與桌面版參數完全一致
+  • MomentumScreener: 完整六策略
+      basic / standard / strict / channel / rs_strong / all
+  • DisposalStockFetcher + 月線距離 (不變)
+零 UI 依賴, Streamlit 與 Telegram Bot 共用。
+"""
+import os
+import requests
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from datetime import datetime, timedelta
+from scipy.stats import linregress
+
+# ==================================================================
+#   股票池
+# ==================================================================
+DEFAULT_STOCK_POOL = {
+    "2330.TW": "台積電", "2317.TW": "鴻海",   "2454.TW": "聯發科",
+    "2308.TW": "台達電", "2382.TW": "廣達",   "2891.TW": "中信金",
+    "2881.TW": "富邦金", "3008.TW": "大立光", "2412.TW": "中華電",
+    "1301.TW": "台塑",   "1303.TW": "南亞",   "2002.TW": "中鋼",
+    "2603.TW": "長榮",   "2609.TW": "陽明",   "3481.TW": "群創",
+    "6282.TW": "康舒",   "3035.TW": "智原",   "3037.TW": "欣興",
+    "3017.TW": "奇鋐",   "2376.TW": "技嘉",   "2377.TW": "微星",
+    "2379.TW": "瑞昱",   "3231.TW": "緯創",   "2356.TW": "英業達",
+    "2474.TW": "可成",   "6505.TW": "台塑化", "5871.TW": "中租-KY",
+    "2207.TW": "和泰車", "1216.TW": "統一",   "2880.TW": "華南金",
+}
+
+# 六種策略定義 (給 UI 用)
+STRATEGY_LEVELS = [
+    ("basic",     "🟢 Basic — 多頭排列 + 帶量突破",
+     "原始 3 條件: 多頭排列 + 突破 20 日高 + 流動性"),
+    ("standard",  "🟡 Standard — 含動能濾鏡",
+     "Basic + RSI 區間 + MACD 動能 + 不可追高 (離 50MA)"),
+    ("strict",    "🔴 Strict — Minervini 飆股原型",
+     "Standard + 150/200MA + 52週高低 + RS Rating (較慢, 抓 2 年資料)"),
+    ("channel",   "📐 Channel — 下降通道突破 (旗桿型態)",
+     "120 天找高點, 擬合下降壓力線, 帶量突破"),
+    ("rs_strong", "🛡️ RS Strong — 大盤大跌抗跌",
+     "過去 90 天大盤跌 >2% 時個股逆勢收紅 ≥3 次 (含最新一次)"),
+    ("all",       "🔥 All — 任一策略成立 (訊號最多)",
+     "Standard ∪ Channel ∪ RS Strong, 廣撒網"),
+]
+
+
+# ==================================================================
+#   StrategyParams — 三種預設組 (與桌面版一致)
+# ==================================================================
+class StrategyParams:
+    _defaults = {
+        "vol_multiplier":         2.0,
+        "min_vol_lots":           1000,
+        "channel_vol_multiplier": 1.5,
+        "breakout_window":        20,
+        "rsi_min":                50,
+        "rsi_max":                75,
+        "require_macd_positive":  True,
+        "max_extension_pct":      25,
+        "channel_lookback":       120,
+        "channel_min_len":        30,
+        "channel_min_r2":         0.3,
+        "channel_min_slope":      -0.02,
+        "rs_lookback":            90,
+        "market_drop_threshold":  -0.02,
+        "rs_min_count":           3,
+        "rs_max_count":           15,
+        "high_52w_min_pct":       0.75,
+        "low_52w_min_mult":       1.30,
+        "rs_rating_min":          70,
+    }
+    _presets = {
+        "conservative": {   # 🛡️ 保守
+            "vol_multiplier": 2.5, "min_vol_lots": 2000,
+            "channel_vol_multiplier": 2.0, "breakout_window": 30,
+            "rsi_min": 55, "rsi_max": 70, "require_macd_positive": True,
+            "max_extension_pct": 15, "channel_min_len": 40,
+            "channel_min_r2": 0.4, "channel_min_slope": -0.03,
+            "market_drop_threshold": -0.025, "rs_min_count": 5,
+            "high_52w_min_pct": 0.85, "low_52w_min_mult": 1.40,
+            "rs_rating_min": 80,
+        },
+        "standard": {},     # ⚖️ 標準 = 預設值
+        "aggressive": {     # 🔥 寬鬆
+            "vol_multiplier": 1.5, "min_vol_lots": 500,
+            "channel_vol_multiplier": 1.2, "breakout_window": 15,
+            "rsi_min": 45, "rsi_max": 85, "require_macd_positive": False,
+            "max_extension_pct": 35, "channel_min_len": 20,
+            "channel_min_r2": 0.2, "channel_min_slope": -0.01,
+            "market_drop_threshold": -0.015, "rs_min_count": 2,
+            "high_52w_min_pct": 0.65, "low_52w_min_mult": 1.20,
+            "rs_rating_min": 60,
+        },
+    }
+    PRESET_LABELS = {
+        "conservative": "🛡️ 保守 (訊號少, 品質高)",
+        "standard":     "⚖️ 標準 (平衡預設)",
+        "aggressive":   "🔥 寬鬆 (訊號多, 廣撒網)",
+    }
+    _current: dict = None
+
+    @classmethod
+    def get(cls) -> dict:
+        if cls._current is None:
+            cls._current = cls._defaults.copy()
+        return cls._current.copy()
+
+    @classmethod
+    def set_batch(cls, updates: dict):
+        if cls._current is None:
+            cls._current = cls._defaults.copy()
+        cls._current.update(updates)
+
+    @classmethod
+    def apply_preset(cls, name: str) -> dict:
+        cls._current = cls._defaults.copy()
+        if name in cls._presets:
+            cls._current.update(cls._presets[name])
+        return cls._current.copy()
+
+    @classmethod
+    def preset_values(cls, name: str) -> dict:
+        base = cls._defaults.copy()
+        base.update(cls._presets.get(name, {}))
+        return base
+
+
+# ==================================================================
+#   股價抓取 (yfinance + 記憶體快取)
+# ==================================================================
+class StockDataFetcher:
+    _cache: dict = {}
+
+    @classmethod
+    def fetch_history(cls, ticker: str, period: str = "6mo",
+                      force_refresh: bool = False) -> pd.DataFrame:
+        today_key = datetime.now().strftime("%Y-%m-%d")
+        cache_key = f"{ticker}_{period}_{today_key}"
+        if not force_refresh and cache_key in cls._cache:
+            return cls._cache[cache_key].copy()
+        try:
+            df = yf.Ticker(ticker).history(period=period, auto_adjust=False)
+            if df.empty:
+                return pd.DataFrame()
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            df.index = df.index.normalize()
+            cls._cache[cache_key] = df.copy()
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    @classmethod
+    def clear_cache(cls):
+        cls._cache.clear()
+
+
+# ==================================================================
+#   六策略篩選器 (完整移植)
+# ==================================================================
+class MomentumScreener:
+    LONG_MA = 60
+
+    # ---------- 指標 ----------
+    @classmethod
+    def compute_indicators(cls, df: pd.DataFrame) -> pd.DataFrame:
+        p = StrategyParams.get()
+        out = df.copy()
+        out["MA5"]  = out["Close"].rolling(5).mean()
+        out["MA20"] = out["Close"].rolling(20).mean()
+        out["MA60"] = out["Close"].rolling(60).mean()
+        out["MA50"] = out["Close"].rolling(50).mean()
+        out["VolMA20"] = out["Volume"].rolling(20).mean()
+        out["High20Prev"] = out["High"].rolling(
+            int(p["breakout_window"])).max().shift(1)
+        out["RSI14"] = cls._calc_rsi(out["Close"], 14)
+        macd, sig, hist = cls._calc_macd(out["Close"])
+        out["MACD"], out["MACDsig"], out["MACDhist"] = macd, sig, hist
+        # Strict 用
+        out["MA150"] = out["Close"].rolling(150).mean()
+        out["MA200"] = out["Close"].rolling(200).mean()
+        out["MA200_30dAgo"] = out["MA200"].shift(30)
+        out["High52w"] = out["High"].rolling(252, min_periods=60).max()
+        out["Low52w"]  = out["Low"].rolling(252, min_periods=60).min()
+        return out
+
+    @staticmethod
+    def _calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+        delta = close.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1.0/period, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1.0/period, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def _calc_macd(close, fast=12, slow=26, signal=9):
+        ema_f = close.ewm(span=fast, adjust=False).mean()
+        ema_s = close.ewm(span=slow, adjust=False).mean()
+        macd = ema_f - ema_s
+        sig = macd.ewm(span=signal, adjust=False).mean()
+        return macd, sig, macd - sig
+
+    # ---------- 三等級條件 ----------
+    @classmethod
+    def _check_basic(cls, row) -> bool:
+        p = StrategyParams.get()
+        try:
+            close, vol = row["Close"], row["Volume"]
+            ma5, ma20, ma60 = row["MA5"], row["MA20"], row["MA60"]
+            vol_ma20, high20 = row["VolMA20"], row["High20Prev"]
+        except KeyError:
+            return False
+        if pd.isna([ma5, ma20, ma60, vol_ma20, high20]).any():
+            return False
+        return (close > ma5 > ma20 > ma60
+                and close > high20
+                and vol > vol_ma20 * p["vol_multiplier"]
+                and vol_ma20 >= p["min_vol_lots"] * 1000)
+
+    @classmethod
+    def _check_standard(cls, row) -> bool:
+        if not cls._check_basic(row):
+            return False
+        p = StrategyParams.get()
+        try:
+            close, ma50 = row["Close"], row["MA50"]
+            rsi, hist = row["RSI14"], row["MACDhist"]
+        except KeyError:
+            return False
+        if pd.isna([ma50, rsi, hist]).any():
+            return False
+        if not (p["rsi_min"] <= rsi <= p["rsi_max"]):
+            return False
+        if p["require_macd_positive"] and hist <= 0:
+            return False
+        if (close - ma50) / ma50 > p["max_extension_pct"] / 100:
+            return False
+        return True
+
+    @classmethod
+    def _check_strict(cls, row, rs_rating=None) -> bool:
+        if not cls._check_standard(row):
+            return False
+        p = StrategyParams.get()
+        try:
+            close = row["Close"]
+            ma50, ma150, ma200 = row["MA50"], row["MA150"], row["MA200"]
+            ma200_30d = row["MA200_30dAgo"]
+            high52, low52 = row["High52w"], row["Low52w"]
+        except KeyError:
+            return False
+        if pd.isna([ma150, ma200, ma200_30d, high52, low52]).any():
+            return False
+        if not (close > ma150 and close > ma200):
+            return False
+        if not (ma150 > ma200):
+            return False
+        if not (ma200 > ma200_30d):
+            return False
+        if not (ma50 > ma150 > ma200):
+            return False
+        if not (close >= low52 * p["low_52w_min_mult"]):
+            return False
+        if not (close >= high52 * p["high_52w_min_pct"]):
+            return False
+        if rs_rating is not None and rs_rating < p["rs_rating_min"]:
+            return False
+        return True
+
+    @staticmethod
+    def calc_rs_rating(df, benchmark_df, lookback=126) -> float:
+        if len(df) < lookback + 1 or len(benchmark_df) < lookback + 1:
+            return 50.0
+        try:
+            s = df["Close"].iloc[-1] / df["Close"].iloc[-lookback] - 1
+            b = benchmark_df["Close"].iloc[-1] / benchmark_df["Close"].iloc[-lookback] - 1
+        except (IndexError, KeyError):
+            return 50.0
+        return float(max(0, min(100, 50 + (s - b) * 100)))
+
+    # ---------- basic / standard / strict 即時檢查 ----------
+    @classmethod
+    def check_stock(cls, ticker, name, level="basic", benchmark_df=None):
+        df = StockDataFetcher.fetch_history(
+            ticker, period="2y" if level == "strict" else "6mo")
+        min_req = 250 if level == "strict" else cls.LONG_MA + 5
+        if df.empty or len(df) < min_req:
+            return None
+        df = cls.compute_indicators(df)
+        last = df.iloc[-1]
+
+        rs_rating = None
+        if level == "strict" and benchmark_df is not None:
+            rs_rating = cls.calc_rs_rating(df, benchmark_df)
+
+        ok = (cls._check_basic(last) if level == "basic"
+              else cls._check_standard(last) if level == "standard"
+              else cls._check_strict(last, rs_rating))
+        if not ok:
+            return None
+        return {
+            "ticker": ticker, "name": name,
+            "close": round(float(last["Close"]), 2),
+            "volume": int(last["Volume"]),
+            "vol_ratio": round(float(last["Volume"] / last["VolMA20"]), 2)
+                         if last["VolMA20"] else 0,
+            "rsi": round(float(last.get("RSI14", 0)), 1),
+            "rs_rating": round(rs_rating, 1) if rs_rating else None,
+            "level": level, "matched": level,
+        }
+
+    # ---------- Channel 通道突破 ----------
+    @classmethod
+    def _check_channel_row(cls, df, end_idx=None):
+        p = StrategyParams.get()
+        if end_idx is None:
+            end_idx = len(df) - 1
+        lookback = int(p["channel_lookback"])
+        if end_idx < lookback:
+            return None
+        sub = df.iloc[max(0, end_idx - lookback):end_idx + 1]
+        if len(sub) < max(100, int(p["channel_min_len"]) + 10):
+            return None
+        vol_ma20 = sub["Volume"].tail(20).mean()
+        if vol_ma20 < p["min_vol_lots"] * 1000:
+            return None
+        ma90 = sub["Close"].rolling(90).mean()
+        if pd.isna(ma90.iloc[-1]) or pd.isna(ma90.iloc[-20]):
+            return None
+        if ma90.iloc[-1] <= ma90.iloc[-20]:
+            return None
+        peak_idx = sub["High"].argmax()
+        if peak_idx >= len(sub) - 5:
+            return None
+        corr = sub.iloc[peak_idx:-1]
+        if len(corr) < p["channel_min_len"]:
+            return None
+        x = np.arange(len(corr))
+        try:
+            slope, intercept, r, _, _ = linregress(x, corr["High"].values)
+        except Exception:
+            return None
+        if slope >= p["channel_min_slope"] or r ** 2 < p["channel_min_r2"]:
+            return None
+        today = sub.iloc[-1]
+        resistance = slope * len(corr) + intercept
+        if today["Close"] <= resistance:
+            return None
+        if today["Volume"] < vol_ma20 * p["channel_vol_multiplier"]:
+            return None
+        return {
+            "today_close": round(float(today["Close"]), 2),
+            "today_volume": int(today["Volume"]),
+            "vol_ma20": int(vol_ma20),
+            "channel_days": len(corr),
+            "r_squared": round(float(r ** 2), 2),
+        }
+
+    @classmethod
+    def check_channel_breakout(cls, ticker, name):
+        df = StockDataFetcher.fetch_history(ticker, period="1y")
+        if df.empty or len(df) < 120:
+            return None
+        res = cls._check_channel_row(df)
+        if res is None:
+            return None
+        return {
+            "ticker": ticker, "name": name,
+            "close": res["today_close"], "volume": res["today_volume"],
+            "vol_ratio": round(res["today_volume"] / res["vol_ma20"], 2)
+                         if res["vol_ma20"] else 0,
+            "rsi": 0, "rs_rating": None,
+            "level": "channel",
+            "matched": f"通道{res['channel_days']}天 R²={res['r_squared']}",
+        }
+
+    # ---------- RS Strong 抗跌 ----------
+    @classmethod
+    def get_market_crash_dates(cls):
+        p = StrategyParams.get()
+        try:
+            twii = yf.Ticker("^TWII").history(period="6mo")
+            if twii.empty:
+                return set(), None
+            if twii.index.tz is not None:
+                twii.index = twii.index.tz_localize(None)
+            twii["PctChg"] = twii["Close"].pct_change()
+            crashes = twii[twii["PctChg"] <= p["market_drop_threshold"]] \
+                .tail(int(p["rs_lookback"]))
+            dates = sorted(set(crashes.index.strftime("%Y-%m-%d")))
+            return set(dates), (dates[-1] if dates else None)
+        except Exception:
+            return set(), None
+
+    @classmethod
+    def check_rs_strong(cls, ticker, name, crash_dates=None, latest_crash=None):
+        p = StrategyParams.get()
+        if crash_dates is None:
+            crash_dates, latest_crash = cls.get_market_crash_dates()
+            if not crash_dates:
+                return None
+        df = StockDataFetcher.fetch_history(ticker, period="6mo")
+        if df.empty or len(df) < p["rs_lookback"] + 5:
+            return None
+        if df["Volume"].tail(5).mean() < p["min_vol_lots"] * 1000:
+            return None
+        if df["Close"].tail(30).mean() <= df["Close"].tail(60).mean():
+            return None
+        recent = df.tail(int(p["rs_lookback"])).copy()
+        recent["PrevClose"] = df["Close"].shift(1).loc[recent.index]
+        rs_dates = [d.strftime("%Y-%m-%d") for d, row in recent.iterrows()
+                    if d.strftime("%Y-%m-%d") in crash_dates
+                    and row["Close"] > row["PrevClose"]]
+        count = len(rs_dates)
+        if not (p["rs_min_count"] <= count <= p["rs_max_count"]):
+            return None
+        if latest_crash and latest_crash not in rs_dates:
+            return None
+        last = df.iloc[-1]
+        return {
+            "ticker": ticker, "name": name,
+            "close": round(float(last["Close"]), 2),
+            "volume": int(last["Volume"]),
+            "vol_ratio": round(float(last["Volume"] /
+                               df["Volume"].tail(20).mean()), 2),
+            "rsi": 0, "rs_rating": None,
+            "level": "rs_strong",
+            "matched": f"抗跌 {count} 次",
+        }
+
+    # ---------- 六策略統一掃描 ----------
+    @classmethod
+    def scan_pool(cls, level="basic", pool=None, progress_cb=None):
+        pool = pool or DEFAULT_STOCK_POOL
+        hits = []
+        total = len(pool)
+
+        benchmark_df = None
+        crash_dates, latest_crash = None, None
+        if level == "strict":
+            benchmark_df = StockDataFetcher.fetch_history("^TWII", period="2y")
+        if level in ("rs_strong", "all"):
+            crash_dates, latest_crash = cls.get_market_crash_dates()
+
+        for i, (tk, nm) in enumerate(pool.items(), 1):
+            if progress_cb:
+                progress_cb(i, total, f"{tk} {nm}")
+            info = None
+            try:
+                if level in ("basic", "standard", "strict"):
+                    info = cls.check_stock(tk, nm, level=level,
+                                           benchmark_df=benchmark_df)
+                elif level == "channel":
+                    info = cls.check_channel_breakout(tk, nm)
+                elif level == "rs_strong":
+                    if crash_dates:
+                        info = cls.check_rs_strong(tk, nm, crash_dates,
+                                                   latest_crash)
+                elif level == "all":
+                    matched = []
+                    r = cls.check_stock(tk, nm, level="standard")
+                    if r:
+                        matched.append("Standard")
+                        info = r
+                    r2 = cls.check_channel_breakout(tk, nm)
+                    if r2:
+                        matched.append("Channel")
+                        info = info or r2
+                    if crash_dates:
+                        r3 = cls.check_rs_strong(tk, nm, crash_dates,
+                                                 latest_crash)
+                        if r3:
+                            matched.append("RS強")
+                            info = info or r3
+                    if info:
+                        info = dict(info)
+                        info["matched"] = " + ".join(matched)
+            except Exception:
+                info = None
+            if info:
+                hits.append(info)
+        hits.sort(key=lambda x: x["vol_ratio"], reverse=True)
+        return hits
+
+
+# ==================================================================
+#   處置股 + 月線 (與 v1 相同)
+# ==================================================================
+class DisposalStockFetcher:
+    API_URL = "https://www.twse.com.tw/announcement/punish"
+    HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) '
+                      'Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+    }
+    _last_error = ""
+
+    @classmethod
+    def get_last_error(cls):
+        return cls._last_error
+
+    @staticmethod
+    def _is_common_stock(code: str) -> bool:
+        code = str(code).strip()
+        return len(code) == 4 and code.isdigit() and not code.startswith("00")
+
+    @staticmethod
+    def _roc_to_western(roc: str):
+        try:
+            parts = roc.strip().replace("-", "/").split("/")
+            if len(parts) != 3:
+                return None
+            return f"{int(parts[0]) + 1911:04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+        except (ValueError, IndexError):
+            return None
+
+    @classmethod
+    def fetch_disposal_list(cls, days_back: int = 30) -> list:
+        cls._last_error = ""
+        end = datetime.now()
+        start = end - timedelta(days=days_back)
+        try:
+            resp = requests.get(cls.API_URL, params={
+                "response": "json",
+                "startDate": start.strftime("%Y%m%d"),
+                "endDate": end.strftime("%Y%m%d"),
+            }, headers=cls.HEADERS, timeout=15)
+            if resp.status_code != 200:
+                cls._last_error = f"HTTP {resp.status_code}"
+                return []
+            payload = resp.json()
+            if payload.get("stat") != "OK":
+                cls._last_error = f"stat={payload.get('stat')}"
+                return []
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            seen = {}
+            for row in payload.get("data", []):
+                if len(row) < 9:
+                    continue
+                code = str(row[2]).strip()
+                if not cls._is_common_stock(code):
+                    continue
+                period = str(row[6]).strip()
+                for sep in ["～", "~", "—"]:
+                    if sep in period:
+                        parts = period.split(sep)
+                        break
+                else:
+                    parts = [period]
+                ds = cls._roc_to_western(parts[0]) if parts else None
+                de = cls._roc_to_western(parts[1]) if len(parts) > 1 else None
+                rec = {
+                    "code": code, "name": str(row[3]).strip(),
+                    "publish_date": cls._roc_to_western(str(row[1])) or "",
+                    "disposal_start": ds or "", "disposal_end": de or "",
+                    "condition": str(row[5]).strip(),
+                    "measure": str(row[7]).strip(),
+                    "is_active": bool(ds and de and ds <= today_str <= de),
+                }
+                if code not in seen or rec["disposal_start"] > seen[code]["disposal_start"]:
+                    seen[code] = rec
+            return list(seen.values())
+        except Exception as e:
+            cls._last_error = str(e)
+            return []
+
+
+def check_disposal_ma20(code, name, disposal):
+    ticker = f"{code}.TW"
+    df = StockDataFetcher.fetch_history(ticker, period="3mo")
+    if df.empty or len(df) < 20:
+        return None
+    df = df.copy()
+    df["MA20"] = df["Close"].rolling(20).mean()
+    last = df.iloc[-1]
+    close = float(last["Close"])
+    ma20 = float(last["MA20"]) if not pd.isna(last["MA20"]) else None
+    if not ma20 or ma20 <= 0:
+        return None
+    diff = (close - ma20) / ma20 * 100
+    ad = abs(diff)
+    chg5 = (close / float(df["Close"].iloc[-6]) - 1) * 100 if len(df) >= 6 else 0
+    return {
+        "code": code, "name": name,
+        "close": round(close, 2), "ma20": round(ma20, 2),
+        "diff_pct": round(diff, 2), "abs_diff_pct": round(ad, 2),
+        "color": "🔴" if ad <= 2 else "🟡" if ad <= 5 else "⚪",
+        "change_5d_pct": round(chg5, 2),
+        "disposal": disposal,
+    }
+
+
+def scan_disposal_ma20(days_back=30, only_active=True, progress_cb=None):
+    dlist = DisposalStockFetcher.fetch_disposal_list(days_back)
+    if only_active:
+        dlist = [d for d in dlist if d["is_active"]]
+    results = []
+    total = len(dlist)
+    for i, d in enumerate(dlist, 1):
+        if progress_cb:
+            progress_cb(i, total, f"{d['code']} {d['name']}")
+        info = check_disposal_ma20(d["code"], d["name"], d)
+        if info:
+            results.append(info)
+    results.sort(key=lambda x: x["abs_diff_pct"])
+    return results
