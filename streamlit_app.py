@@ -139,12 +139,18 @@ def plot_candlestick(ticker: str, name: str, note: str = "",
     st.caption("🖐️ 拖曳=左右平移  |  🤏 兩指/滾輪=縮放  |  👆👆 雙擊=還原")
 
 
-# ================= 兩分頁 (參數已併入篩選頁) =================
-tab_screener, tab_disposal = st.tabs(
-    ["🎯 即時飆股篩選", "🚨 處置股+月線"])
+# ================= 導航 (session_state 版, 修正 st.tabs 會跳回第一頁的問題) =================
+PAGE_SCREENER = "🎯 即時飆股篩選"
+PAGE_DISPOSAL = "🚨 處置股+月線"
+page = st.radio("nav", [PAGE_SCREENER, PAGE_DISPOSAL],
+                horizontal=True, key="nav_page",
+                label_visibility="collapsed")
+st.markdown("""<style>
+div[role="radiogroup"] label { font-size: 1.05rem; padding: 2px 10px; }
+</style>""", unsafe_allow_html=True)
 
-# ============ Tab 1: 即時飆股篩選 (參數 + 六策略 + 左表右圖) ============
-with tab_screener:
+# ============ Page 1: 即時飆股篩選 (參數 + 六策略 + 左表右圖) ============
+if page == PAGE_SCREENER:
     # ---- 參數預設組 (原「參數設定」分頁併入此處) ----
     def _apply(preset):
         st.session_state.preset = preset
@@ -266,8 +272,8 @@ with tab_screener:
         st.warning("❗ 沒有符合條件的個股 — 可切成 🔥 寬鬆預設組再試")
 
 
-# ============ Tab 2: 處置股+月線 (左表右圖) ============
-with tab_disposal:
+# ============ Page 2: 處置股+月線 (左表右圖) ============
+else:
     c1, c2 = st.columns(2)
     with c1:
         days_back = st.selectbox("查詢區間", [7, 14, 30, 60], index=2,
