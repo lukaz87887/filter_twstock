@@ -105,9 +105,22 @@ def plot_candlestick(ticker: str, name: str, note: str = "",
         xaxis_rangeslider_visible=False, height=560,
         margin=dict(l=8, r=8, t=48, b=8),
         legend=dict(orientation="h", y=1.02, x=0),
-        hovermode="x unified")
+        hovermode="x unified",
+        dragmode="pan")                     # 預設 = 平移 (不是框選縮放)
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-    st.plotly_chart(fig, use_container_width=True)
+    # ★ 鎖定 Y 軸: 只能左右移動與 X 軸縮放, 不會上下滑飛走
+    fig.update_yaxes(fixedrange=True)
+    st.plotly_chart(
+        fig, use_container_width=True,
+        config={
+            "scrollZoom": True,             # 滾輪 / 兩指縮放 (只作用 X 軸)
+            "doubleClick": "reset",         # 雙擊 / 雙指點 = 還原視圖
+            "displaylogo": False,
+            "modeBarButtonsToRemove": [
+                "select2d", "lasso2d", "zoom2d",
+                "zoomIn2d", "zoomOut2d", "autoScale2d"],
+        })
+    st.caption("🖐️ 拖曳=左右平移  |  🤏 兩指/滾輪=縮放  |  👆👆 雙擊=還原")
 
 
 # ================= 三分頁 =================
