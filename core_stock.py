@@ -489,6 +489,272 @@ class MomentumScreener:
         return hits
 
 
+    # =====================================================
+    #   v3: 以現成 DataFrame 檢查 (全市場批次掃描用)
+    # =====================================================
+    @classmethod
+    def _check_rs_strong_df(cls, df, ticker, name, crash_dates, latest_crash):
+        p = StrategyParams.get()
+        if df is None or df.empty or len(df) < p["rs_lookback"] + 5:
+            return None
+        if df["Volume"].tail(5).mean() < p["min_vol_lots"] * 1000:
+            return None
+        if df["Close"].tail(30).mean() <= df["Close"].tail(60).mean():
+            return None
+        recent = df.tail(int(p["rs_lookback"])).copy()
+        recent["PrevClose"] = df["Close"].shift(1).loc[recent.index]
+        rs_dates = [d.strftime("%Y-%m-%d") for d, row in recent.iterrows()
+                    if d.strftime("%Y-%m-%d") in crash_dates
+                    and row["Close"] > row["PrevClose"]]
+        count = len(rs_dates)
+        if not (p["rs_min_count"] <= count <= p["rs_max_count"]):
+            return None
+        if latest_crash and latest_crash not in rs_dates:
+            return None
+        last = df.iloc[-1]
+        return {
+            "ticker": ticker, "name": name,
+            "close": round(float(last["Close"]), 2),
+            "volume": int(last["Volume"]),
+            "vol_ratio": round(float(last["Volume"] /
+                               max(df["Volume"].tail(20).mean(), 1)), 2),
+            "rsi": 0, "rs_rating": None,
+            "level": "rs_strong", "matched": f"抗跌 {count} 次",
+        }
+
+    @classmethod
+    def check_from_df(cls, df, ticker, name, level="basic",
+                      benchmark_df=None, crash_dates=None, latest_crash=None):
+        """統一入口: 給定 OHLCV DataFrame, 依 level 檢查 (支援全部六策略)"""
+        if df is None or df.empty:
+            return None
+
+        if level in ("basic", "standard", "strict"):
+            min_req = 250 if level == "strict" else cls.LONG_MA + 5
+            if len(df) < min_req:
+                return None
+            ind = cls.compute_indicators(df)
+            last = ind.iloc[-1]
+            rs_rating = None
+            if level == "strict" and benchmark_df is not None:
+                rs_rating = cls.calc_rs_rating(df, benchmark_df)
+            ok = (cls._check_basic(last) if level == "basic"
+                  else cls._check_standard(last) if level == "standard"
+                  else cls._check_strict(last, rs_rating))
+            if not ok:
+                return None
+            return {
+                "ticker": ticker, "name": name,
+                "close": round(float(last["Close"]), 2),
+                "volume": int(last["Volume"]),
+                "vol_ratio": round(float(last["Volume"] / last["VolMA20"]), 2)
+                             if last["VolMA20"] else 0,
+                "rsi": round(float(last.get("RSI14", 0) or 0), 1),
+                "rs_rating": round(rs_rating, 1) if rs_rating else None,
+                "level": level, "matched": level,
+            }
+
+        if level == "channel":
+            if len(df) < 120:
+                return None
+            res = cls._check_channel_row(df)
+            if res is None:
+                return None
+            return {
+                "ticker": ticker, "name": name,
+                "close": res["today_close"], "volume": res["today_volume"],
+                "vol_ratio": round(res["today_volume"] /
+                                   max(res["vol_ma20"], 1), 2),
+                "rsi": 0, "rs_rating": None, "level": "channel",
+                "matched": f"通道{res['channel_days']}天 R²={res['r_squared']}",
+            }
+
+        if level == "rs_strong":
+            if not crash_dates:
+                return None
+            return cls._check_rs_strong_df(df, ticker, name,
+                                           crash_dates, latest_crash)
+
+        if level == "all":
+            matched, info = [], None
+            r = cls.check_from_df(df, ticker, name, "standard")
+            if r:
+                matched.append("Standard"); info = r
+            r2 = cls.check_from_df(df, ticker, name, "channel")
+            if r2:
+                matched.append("Channel"); info = info or r2
+            if crash_dates:
+                r3 = cls._check_rs_strong_df(df, ticker, name,
+                                             crash_dates, latest_crash)
+                if r3:
+                    matched.append("RS強"); info = info or r3
+            if info:
+                info = dict(info)
+                info["matched"] = " + ".join(matched)
+            return info
+        return None
+
+    @classmethod
+    def scan_frames(cls, frames: dict, names: dict, level="basic",
+                    progress_cb=None):
+        """全市場掃描: 對已下載的 {code: df} 逐一跑 check_from_df"""
+        benchmark_df = None
+        crash_dates, latest_crash = None, None
+        if level == "strict":
+            benchmark_df = StockDataFetcher.fetch_history("^TWII", period="2y")
+        if level in ("rs_strong", "all"):
+            crash_dates, latest_crash = cls.get_market_crash_dates()
+
+        hits = []
+        total = len(frames)
+        for i, (code, df) in enumerate(frames.items(), 1):
+            if progress_cb and (i % 25 == 0 or i == total):
+                progress_cb(i, total, f"{code} {names.get(code, '')}")
+            try:
+                info = cls.check_from_df(
+                    df, f"{code}.TW", names.get(code, code), level,
+                    benchmark_df, crash_dates, latest_crash)
+            except Exception:
+                info = None
+            if info:
+                hits.append(info)
+        hits.sort(key=lambda x: x["vol_ratio"], reverse=True)
+        return hits
+
+
+
+# ==================================================================
+#   全市場抓取器 (v3 新增) — 兩段式全上市掃描
+#   Stage 1: 證交所 MI_INDEX 一個請求拿全部上市股清單+當日量 (流動性預過濾)
+#   Stage 2: yfinance 批次下載 (一次 150 檔, 多執行緒)
+# ==================================================================
+class FullMarketFetcher:
+    MI_URL = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
+    HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) '
+                      'Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+    }
+    _last_error = ""
+
+    @classmethod
+    def get_last_error(cls):
+        return cls._last_error
+
+    @staticmethod
+    def _is_common_stock(code: str) -> bool:
+        code = str(code).strip()
+        return len(code) == 4 and code.isdigit() and not code.startswith("00")
+
+    @staticmethod
+    def _extract_quote_table(payload):
+        """MI_INDEX 回傳格式歷經改版, 兩種都支援"""
+        # 新版: payload["tables"] = [{title, fields, data}, ...]
+        for t in payload.get("tables", []):
+            f = t.get("fields", [])
+            if "證券代號" in f and "收盤價" in f:
+                return f, t.get("data", [])
+        # 舊版: fields9/data9, fields8/data8 ...
+        for i in range(9, 0, -1):
+            f = payload.get(f"fields{i}")
+            d = payload.get(f"data{i}")
+            if f and d and "證券代號" in f:
+                return f, d
+        return None, None
+
+    @classmethod
+    def fetch_stock_list(cls, min_today_lots: int = 100):
+        """
+        抓最近一個交易日的全上市股票清單 (含當日成交量, 用於流動性預過濾)
+        Returns: (list[{code, name, today_lots}], data_date_str) 或 ([], None)
+        """
+        cls._last_error = ""
+        for back in range(0, 10):
+            d = datetime.now() - timedelta(days=back)
+            if d.weekday() >= 5:
+                continue
+            ds = d.strftime("%Y%m%d")
+            try:
+                r = requests.get(cls.MI_URL, params={
+                    "response": "json", "date": ds, "type": "ALLBUT0999",
+                }, headers=cls.HEADERS, timeout=30)
+                if r.status_code != 200:
+                    continue
+                payload = r.json()
+                if payload.get("stat") != "OK":
+                    continue
+                fields, data = cls._extract_quote_table(payload)
+                if not fields:
+                    cls._last_error = "找不到行情表 (API 格式改版?)"
+                    continue
+                i_code = fields.index("證券代號")
+                i_name = fields.index("證券名稱")
+                i_vol = fields.index("成交股數")
+                stocks = []
+                for row in data:
+                    code = str(row[i_code]).strip()
+                    if not cls._is_common_stock(code):
+                        continue
+                    try:
+                        vol = int(str(row[i_vol]).replace(",", "")) // 1000
+                    except (ValueError, TypeError):
+                        vol = 0
+                    if vol < min_today_lots:
+                        continue
+                    stocks.append({"code": code,
+                                   "name": str(row[i_name]).strip(),
+                                   "today_lots": vol})
+                if stocks:
+                    return stocks, d.strftime("%Y-%m-%d")
+            except Exception as e:
+                cls._last_error = str(e)
+                continue
+        return [], None
+
+    @classmethod
+    def batch_download(cls, codes: list, period: str = "6mo",
+                       progress_cb=None, chunk_size: int = 150) -> dict:
+        """yfinance 批次下載, 回傳 {code: OHLCV DataFrame}"""
+        frames = {}
+        tickers = [f"{c}.TW" for c in codes]
+        n_chunks = (len(tickers) + chunk_size - 1) // chunk_size
+        for ci in range(n_chunks):
+            chunk = tickers[ci * chunk_size:(ci + 1) * chunk_size]
+            if progress_cb:
+                progress_cb(ci + 1, n_chunks,
+                            f"批次下載 {ci + 1}/{n_chunks} ({len(chunk)} 檔)")
+            try:
+                data = yf.download(chunk, period=period, auto_adjust=False,
+                                   group_by="ticker", threads=True,
+                                   progress=False)
+            except Exception:
+                continue
+            if data is None or len(data) == 0:
+                continue
+            multi = isinstance(data.columns, pd.MultiIndex)
+            for tk in chunk:
+                code = tk.replace(".TW", "")
+                try:
+                    if multi:
+                        if tk not in set(data.columns.get_level_values(0)):
+                            continue
+                        df = data[tk].copy()
+                    else:
+                        df = data.copy()
+                    df = df.dropna(subset=["Close"])
+                    if df.empty or len(df) < 30:
+                        continue
+                    df["Volume"] = df["Volume"].fillna(0)
+                    if getattr(df.index, "tz", None) is not None:
+                        df.index = df.index.tz_localize(None)
+                    df.index = pd.to_datetime(df.index).normalize()
+                    frames[code] = df
+                except Exception:
+                    continue
+        return frames
+
+
 # ==================================================================
 #   處置股 + 月線 (與 v1 相同)
 # ==================================================================
