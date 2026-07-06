@@ -123,50 +123,37 @@ def plot_candlestick(ticker: str, name: str, note: str = "",
     st.caption("🖐️ 拖曳=左右平移  |  🤏 兩指/滾輪=縮放  |  👆👆 雙擊=還原")
 
 
-# ================= 三分頁 =================
-tab_params, tab_screener, tab_disposal = st.tabs(
-    ["⚙️ 參數設定", "🎯 即時飆股篩選", "🚨 處置股+月線"])
+# ================= 兩分頁 (參數已併入篩選頁) =================
+tab_screener, tab_disposal = st.tabs(
+    ["🎯 即時飆股篩選", "🚨 處置股+月線"])
 
-# ============ Tab 1: 參數設定 (三種預設) ============
-with tab_params:
-    st.subheader("⚙️ 參數設定")
-    st.caption("跟桌面版一樣: 三種預設組一鍵切換, 或展開進階微調")
-
-    c1, c2, c3 = st.columns(3)
+# ============ Tab 1: 即時飆股篩選 (參數 + 六策略 + 左表右圖) ============
+with tab_screener:
+    # ---- 參數預設組 (原「參數設定」分頁併入此處) ----
     def _apply(preset):
         st.session_state.preset = preset
         st.session_state.adv_params = StrategyParams.apply_preset(preset)
 
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.button("🛡️ 保守\n訊號少 品質高", use_container_width=True,
+        st.button("🛡️ 保守", use_container_width=True,
+                  help="訊號少, 品質高",
                   type="primary" if st.session_state.preset == "conservative" else "secondary",
                   on_click=_apply, args=("conservative",))
     with c2:
-        st.button("⚖️ 標準\n平衡預設", use_container_width=True,
+        st.button("⚖️ 標準", use_container_width=True,
+                  help="平衡預設",
                   type="primary" if st.session_state.preset == "standard" else "secondary",
                   on_click=_apply, args=("standard",))
     with c3:
-        st.button("🔥 寬鬆\n訊號多 廣撒網", use_container_width=True,
+        st.button("🔥 寬鬆", use_container_width=True,
+                  help="訊號多, 廣撒網",
                   type="primary" if st.session_state.preset == "aggressive" else "secondary",
                   on_click=_apply, args=("aggressive",))
 
-    st.success(f"目前套用: {StrategyParams.PRESET_LABELS[st.session_state.preset]}")
-
-    # 主要參數一覽
     pv = st.session_state.adv_params
-    st.dataframe(pd.DataFrame([
-        {"參數": "量能放大倍數", "值": pv["vol_multiplier"]},
-        {"參數": "最小20日均量(張)", "值": pv["min_vol_lots"]},
-        {"參數": "突破回看天數", "值": pv["breakout_window"]},
-        {"參數": "RSI 區間", "值": f"{pv['rsi_min']} ~ {pv['rsi_max']}"},
-        {"參數": "MACD 必須為正", "值": "是" if pv["require_macd_positive"] else "否"},
-        {"參數": "離50MA上限%", "值": pv["max_extension_pct"]},
-        {"參數": "通道最短長度", "值": pv["channel_min_len"]},
-        {"參數": "抗跌最少次數", "值": pv["rs_min_count"]},
-        {"參數": "RS Rating 門檻", "值": pv["rs_rating_min"]},
-    ]), use_container_width=True, hide_index=True)
-
-    with st.expander("🔧 進階微調 (改完自動生效)"):
+    with st.expander(f"🔧 參數微調  (目前: "
+                     f"{StrategyParams.PRESET_LABELS[st.session_state.preset]})"):
         a1, a2 = st.columns(2)
         with a1:
             pv["vol_multiplier"] = st.slider("量能放大倍數", 1.0, 5.0,
@@ -190,9 +177,7 @@ with tab_params:
         st.session_state.adv_params = pv
         StrategyParams.set_batch(pv)
 
-
-# ============ Tab 2: 即時飆股篩選 (六策略 + 左表右圖) ============
-with tab_screener:
+    # ---- 策略選擇 ----
     level_labels = {v[0]: v[1] for v in STRATEGY_LEVELS}
     level = st.radio("進場條件策略 (六種)",
                      [v[0] for v in STRATEGY_LEVELS],
@@ -226,7 +211,7 @@ with tab_screener:
             event = st.dataframe(
                 tbl, use_container_width=True, hide_index=True,
                 on_select="rerun", selection_mode="single-row",
-                height=520, key="scr_table")
+                height=420, key="scr_table")
         with col_r:
             rows = event.selection.rows if event and event.selection else []
             idx = rows[0] if rows else 0   # 沒點就先顯示第一名
@@ -236,10 +221,10 @@ with tab_screener:
                                   f"{h.get('matched','')}")
         st.caption("👈 點左表任一列, 右側 K 線立即切換")
     elif "screener_hits" in st.session_state:
-        st.warning("❗ 沒有符合條件的個股 — 可到「⚙️ 參數設定」切成 🔥 寬鬆再試")
+        st.warning("❗ 沒有符合條件的個股 — 可切成 🔥 寬鬆預設組再試")
 
 
-# ============ Tab 3: 處置股+月線 (左表右圖) ============
+# ============ Tab 2: 處置股+月線 (左表右圖) ============
 with tab_disposal:
     c1, c2 = st.columns(2)
     with c1:
