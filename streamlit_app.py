@@ -320,7 +320,16 @@ with tab_disposal:
                        f"{'✅ 生效中' if d['is_active'] else '已結束'}")
         st.caption("👈 點左表任一列, 右側 K 線立即切換")
     elif "disposal_results" in st.session_state:
-        st.warning("❗ 沒有符合條件的處置股")
+        from core_stock import DisposalStockFetcher
+        err = DisposalStockFetcher.get_last_error()
+        if err:
+            st.error(f"❌ 抓取失敗: {err}\n\n"
+                     f"💡 若你在雲端 (streamlit.app) 看到此訊息, "
+                     f"通常是證交所擋海外 IP — 已內建 OpenAPI 備援會自動重試, "
+                     f"若兩者都失敗請把此訊息回報。")
+        else:
+            st.warning("❗ 目前沒有符合條件的處置股 "
+                       "(可取消「只看處置仍生效中」或拉長查詢區間)")
 
 st.divider()
 st.caption("📊 資料來源: Yahoo Finance / 證交所  |  僅供研究參考, 不構成投資建議")

@@ -710,7 +710,56 @@ class FullMarketFetcher:
             except Exception as e:
                 cls._last_error = str(e)
                 continue
+        # ---- 備援: OpenAPI STOCK_DAY_ALL (雲端/海外 IP 友善) ----
+        try:
+            return cls._fetch_list_via_openapi(min_today_lots)
+        except Exception as e:
+            cls._last_error = (f"主要API失敗: {cls._last_error}  |  "
+                               f"備援OpenAPI: {e}")
         return [], None
+
+    @classmethod
+    def _fetch_list_via_openapi(cls, min_today_lots: int):
+        """備援: openapi.twse.com.tw STOCK_DAY_ALL — 最近交易日全部上市個股"""
+        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        r = requests.get(url, headers={**cls.HEADERS,
+                                       'Accept': 'application/json'},
+                         timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        arr = r.json()
+        if not isinstance(arr, list) or not arr:
+            raise RuntimeError("回傳空清單")
+        sample = arr[0]
+        def _k(*cands):
+            for k in sample.keys():
+                ks = str(k); kl = ks.lower()
+                for c in cands:
+                    if c in ks or c.lower() in kl:
+                        return k
+            return None
+        k_code = _k("Code", "代號")
+        k_name = _k("Name", "名稱")
+        k_vol = _k("TradeVolume", "成交股數")
+        if not (k_code and k_vol):
+            raise RuntimeError(f"欄位無法辨識: {list(sample.keys())}")
+        stocks = []
+        for item in arr:
+            code = str(item.get(k_code, "")).strip()
+            if not cls._is_common_stock(code):
+                continue
+            try:
+                vol = int(str(item.get(k_vol, "0")).replace(",", "")) // 1000
+            except (ValueError, TypeError):
+                vol = 0
+            if vol < min_today_lots:
+                continue
+            stocks.append({"code": code,
+                           "name": str(item.get(k_name, "")).strip(),
+                           "today_lots": vol})
+        if not stocks:
+            raise RuntimeError("過濾後 0 檔")
+        return stocks, datetime.now().strftime("%Y-%m-%d")
 
     @classmethod
     def batch_download(cls, codes: list, period: str = "6mo",
@@ -787,55 +836,143 @@ class DisposalStockFetcher:
         except (ValueError, IndexError):
             return None
 
+    OPENAPI_URL = "https://openapi.twse.com.tw/v1/announcement/punish"
+
+    @staticmethod
+    def _roc_any_to_western(s: str):
+        """支援 115/07/07 與 1150707 兩種民國格式"""
+        s = str(s).strip()
+        if "/" in s or "-" in s:
+            return DisposalStockFetcher._roc_to_western(s)
+        if s.isdigit() and len(s) == 7:
+            return DisposalStockFetcher._roc_to_western(
+                f"{s[:3]}/{s[3:5]}/{s[5:7]}")
+        return None
+
+    @staticmethod
+    def _resolve_key(d: dict, *cands):
+        """在 dict 的 key 裡找出包含任一候選字串的 key (中英通吃)"""
+        for k in d.keys():
+            ks = str(k); kl = ks.lower()
+            for c in cands:
+                if c in ks or c.lower() in kl:
+                    return k
+        return None
+
     @classmethod
-    def fetch_disposal_list(cls, days_back: int = 30) -> list:
-        cls._last_error = ""
+    def _parse_period(cls, period: str):
+        period = str(period).strip()
+        for sep in ["～", "~", "—", "-"]:
+            if sep in period:
+                parts = period.split(sep)
+                break
+        else:
+            parts = [period]
+        ds = cls._roc_any_to_western(parts[0]) if parts else None
+        de = cls._roc_any_to_western(parts[1]) if len(parts) > 1 else None
+        return ds, de
+
+    @classmethod
+    def _fetch_via_website(cls, days_back: int) -> list:
+        """主要來源: www.twse.com.tw (台灣 IP 最穩)"""
         end = datetime.now()
         start = end - timedelta(days=days_back)
+        resp = requests.get(cls.API_URL, params={
+            "response": "json",
+            "startDate": start.strftime("%Y%m%d"),
+            "endDate": end.strftime("%Y%m%d"),
+        }, headers=cls.HEADERS, timeout=15)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        payload = resp.json()
+        if payload.get("stat") != "OK":
+            raise RuntimeError(f"stat={payload.get('stat')}")
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        seen = {}
+        for row in payload.get("data", []):
+            if len(row) < 9:
+                continue
+            code = str(row[2]).strip()
+            if not cls._is_common_stock(code):
+                continue
+            ds, de = cls._parse_period(str(row[6]))
+            rec = {
+                "code": code, "name": str(row[3]).strip(),
+                "publish_date": cls._roc_to_western(str(row[1])) or "",
+                "disposal_start": ds or "", "disposal_end": de or "",
+                "condition": str(row[5]).strip(),
+                "measure": str(row[7]).strip(),
+                "is_active": bool(ds and de and ds <= today_str <= de),
+            }
+            if code not in seen or rec["disposal_start"] > seen[code]["disposal_start"]:
+                seen[code] = rec
+        return list(seen.values())
+
+    @classmethod
+    def _fetch_via_openapi(cls) -> list:
+        """備援來源: openapi.twse.com.tw (雲端主機友善, 海外 IP 可用)
+        回傳格式為 JSON array of dict, key 名稱用容錯搜尋 (中英通吃)"""
+        resp = requests.get(cls.OPENAPI_URL,
+                            headers={**cls.HEADERS,
+                                     'Accept': 'application/json'},
+                            timeout=15)
+        if resp.status_code != 200:
+            raise RuntimeError(f"OpenAPI HTTP {resp.status_code}")
+        arr = resp.json()
+        if not isinstance(arr, list) or not arr:
+            raise RuntimeError("OpenAPI 回傳空清單")
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        sample = arr[0]
+        k_code = cls._resolve_key(sample, "證券代號", "代號", "Code")
+        k_name = cls._resolve_key(sample, "證券名稱", "名稱", "Name")
+        k_period = cls._resolve_key(sample, "起訖", "期間", "Period")
+        k_pub = cls._resolve_key(sample, "公布", "Date", "日期")
+        k_cond = cls._resolve_key(sample, "條件", "Condition", "Criteria")
+        k_meas = cls._resolve_key(sample, "措施", "Measure", "Disposition")
+        if not (k_code and k_period):
+            raise RuntimeError(f"OpenAPI 欄位無法辨識: {list(sample.keys())}")
+        seen = {}
+        for item in arr:
+            code = str(item.get(k_code, "")).strip()
+            if not cls._is_common_stock(code):
+                continue
+            ds, de = cls._parse_period(item.get(k_period, ""))
+            rec = {
+                "code": code,
+                "name": str(item.get(k_name, "")).strip(),
+                "publish_date": cls._roc_any_to_western(
+                    item.get(k_pub, "")) or "",
+                "disposal_start": ds or "", "disposal_end": de or "",
+                "condition": str(item.get(k_cond, "")).strip(),
+                "measure": str(item.get(k_meas, "")).strip(),
+                "is_active": bool(ds and de and ds <= today_str <= de),
+            }
+            if code not in seen or rec["disposal_start"] > seen[code]["disposal_start"]:
+                seen[code] = rec
+        return list(seen.values())
+
+    @classmethod
+    def fetch_disposal_list(cls, days_back: int = 30) -> list:
+        """主要 API 失敗自動切 OpenAPI 備援, 兩個都失敗才回空 + 錯誤訊息"""
+        cls._last_error = ""
+        err1 = err2 = ""
         try:
-            resp = requests.get(cls.API_URL, params={
-                "response": "json",
-                "startDate": start.strftime("%Y%m%d"),
-                "endDate": end.strftime("%Y%m%d"),
-            }, headers=cls.HEADERS, timeout=15)
-            if resp.status_code != 200:
-                cls._last_error = f"HTTP {resp.status_code}"
-                return []
-            payload = resp.json()
-            if payload.get("stat") != "OK":
-                cls._last_error = f"stat={payload.get('stat')}"
-                return []
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            seen = {}
-            for row in payload.get("data", []):
-                if len(row) < 9:
-                    continue
-                code = str(row[2]).strip()
-                if not cls._is_common_stock(code):
-                    continue
-                period = str(row[6]).strip()
-                for sep in ["～", "~", "—"]:
-                    if sep in period:
-                        parts = period.split(sep)
-                        break
-                else:
-                    parts = [period]
-                ds = cls._roc_to_western(parts[0]) if parts else None
-                de = cls._roc_to_western(parts[1]) if len(parts) > 1 else None
-                rec = {
-                    "code": code, "name": str(row[3]).strip(),
-                    "publish_date": cls._roc_to_western(str(row[1])) or "",
-                    "disposal_start": ds or "", "disposal_end": de or "",
-                    "condition": str(row[5]).strip(),
-                    "measure": str(row[7]).strip(),
-                    "is_active": bool(ds and de and ds <= today_str <= de),
-                }
-                if code not in seen or rec["disposal_start"] > seen[code]["disposal_start"]:
-                    seen[code] = rec
-            return list(seen.values())
+            recs = cls._fetch_via_website(days_back)
+            if recs:
+                return recs
+            err1 = "回傳 0 筆"
         except Exception as e:
-            cls._last_error = str(e)
-            return []
+            err1 = str(e)
+        try:
+            recs = cls._fetch_via_openapi()
+            if recs:
+                return recs
+            err2 = "回傳 0 筆"
+        except Exception as e:
+            err2 = str(e)
+        cls._last_error = (f"主要API(www.twse): {err1}  |  "
+                           f"備援OpenAPI: {err2}")
+        return []
 
 
 def check_disposal_ma20(code, name, disposal):
