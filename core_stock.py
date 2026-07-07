@@ -607,12 +607,12 @@ class MomentumScreener:
 
         hits = []
         total = len(frames)
-        for i, (code, df) in enumerate(frames.items(), 1):
+        for i, (ticker, df) in enumerate(frames.items(), 1):
             if progress_cb and (i % 25 == 0 or i == total):
-                progress_cb(i, total, f"{code} {names.get(code, '')}")
+                progress_cb(i, total, f"{ticker} {names.get(ticker, '')}")
             try:
                 info = cls.check_from_df(
-                    df, f"{code}.TW", names.get(code, code), level,
+                    df, ticker, names.get(ticker, ticker), level,
                     benchmark_df, crash_dates, latest_crash)
             except Exception:
                 info = None
@@ -663,11 +663,60 @@ class FullMarketFetcher:
                 return f, d
         return None, None
 
+    TPEX_QUOTES_URL = ("https://www.tpex.org.tw/openapi/v1/"
+                       "tpex_mainboard_daily_close_quotes")
+
+    @staticmethod
+    def _resolve_key(d: dict, *cands):
+        for k in d.keys():
+            ks = str(k); kl = ks.lower()
+            for c in cands:
+                if c in ks or c.lower() in kl:
+                    return k
+        return None
+
     @classmethod
-    def fetch_stock_list(cls, min_today_lots: int = 100):
+    def _fetch_tpex_list(cls, min_today_lots: int = 0):
+        """上櫃全部普通股 (櫃買中心 OpenAPI, key 名稱容錯解析)"""
+        r = requests.get(cls.TPEX_QUOTES_URL,
+                         headers={**cls.HEADERS,
+                                  'Accept': 'application/json'},
+                         timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"TPEX HTTP {r.status_code}")
+        arr = r.json()
+        if not isinstance(arr, list) or not arr:
+            raise RuntimeError("TPEX 回傳空清單")
+        s = arr[0]
+        k_code = cls._resolve_key(s, "SecuritiesCompanyCode", "Code", "代號")
+        k_name = cls._resolve_key(s, "CompanyName", "Name", "名稱")
+        k_vol = cls._resolve_key(s, "TradingShares", "TradeVolume",
+                                 "成交股數", "Shares")
+        if not k_code:
+            raise RuntimeError(f"TPEX 欄位無法辨識: {list(s.keys())}")
+        stocks = []
+        for item in arr:
+            code = str(item.get(k_code, "")).strip()
+            if not cls._is_common_stock(code):
+                continue
+            try:
+                vol = int(str(item.get(k_vol, "0")).replace(",", "")) // 1000
+            except (ValueError, TypeError):
+                vol = 0
+            if vol < min_today_lots:
+                continue
+            stocks.append({"code": code,
+                           "name": str(item.get(k_name, "")).strip(),
+                           "today_lots": vol, "market": "TWO"})
+        return stocks
+
+    @classmethod
+    def fetch_stock_list(cls, min_today_lots: int = 0):
         """
-        抓最近一個交易日的全上市股票清單 (含當日成交量, 用於流動性預過濾)
-        Returns: (list[{code, name, today_lots}], data_date_str) 或 ([], None)
+        抓最近交易日「上市 + 上櫃」全部普通股清單。
+        v4: 預設 min_today_lots=0 = 完全不預過濾, 避免任何漏網之魚
+            (流動性條件交由各策略自己判斷)
+        Returns: (list[{code, name, today_lots, market}], date_str)
         """
         cls._last_error = ""
         for back in range(0, 10):
@@ -704,8 +753,13 @@ class FullMarketFetcher:
                         continue
                     stocks.append({"code": code,
                                    "name": str(row[i_name]).strip(),
-                                   "today_lots": vol})
+                                   "today_lots": vol, "market": "TW"})
                 if stocks:
+                    # ★ v4: 追加上櫃 (失敗不影響上市結果, 但記錄警告)
+                    try:
+                        stocks += cls._fetch_tpex_list(min_today_lots)
+                    except Exception as e:
+                        cls._last_error = f"上櫃清單抓取失敗(僅掃上市): {e}"
                     return stocks, d.strftime("%Y-%m-%d")
             except Exception as e:
                 cls._last_error = str(e)
@@ -756,17 +810,24 @@ class FullMarketFetcher:
                 continue
             stocks.append({"code": code,
                            "name": str(item.get(k_name, "")).strip(),
-                           "today_lots": vol})
+                           "today_lots": vol, "market": "TW"})
         if not stocks:
             raise RuntimeError("過濾後 0 檔")
+        try:
+            stocks += cls._fetch_tpex_list(min_today_lots)
+        except Exception:
+            pass
         return stocks, datetime.now().strftime("%Y-%m-%d")
 
     @classmethod
-    def batch_download(cls, codes: list, period: str = "6mo",
+    def batch_download(cls, stock_list: list, period: str = "6mo",
                        progress_cb=None, chunk_size: int = 150) -> dict:
-        """yfinance 批次下載, 回傳 {code: OHLCV DataFrame}"""
+        """yfinance 批次下載 (上市 .TW / 上櫃 .TWO)
+        stock_list: [{code, market}, ...]
+        回傳 {ticker: OHLCV DataFrame} (ticker 含後綴)"""
         frames = {}
-        tickers = [f"{c}.TW" for c in codes]
+        tickers = [f"{s['code']}.{s.get('market', 'TW')}"
+                   for s in stock_list]
         n_chunks = (len(tickers) + chunk_size - 1) // chunk_size
         for ci in range(n_chunks):
             chunk = tickers[ci * chunk_size:(ci + 1) * chunk_size]
@@ -783,7 +844,6 @@ class FullMarketFetcher:
                 continue
             multi = isinstance(data.columns, pd.MultiIndex)
             for tk in chunk:
-                code = tk.replace(".TW", "")
                 try:
                     if multi:
                         if tk not in set(data.columns.get_level_values(0)):
@@ -798,7 +858,7 @@ class FullMarketFetcher:
                     if getattr(df.index, "tz", None) is not None:
                         df.index = df.index.tz_localize(None)
                     df.index = pd.to_datetime(df.index).normalize()
-                    frames[code] = df
+                    frames[tk] = df
                 except Exception:
                     continue
         return frames
@@ -951,32 +1011,91 @@ class DisposalStockFetcher:
                 seen[code] = rec
         return list(seen.values())
 
+    TPEX_DISPOSAL_URL = ("https://www.tpex.org.tw/openapi/v1/"
+                         "tpex_disposal_information")
+
+    @classmethod
+    def _fetch_tpex_disposal(cls) -> list:
+        """上櫃處置股 (櫃買中心 OpenAPI, key 名稱容錯解析)"""
+        r = requests.get(cls.TPEX_DISPOSAL_URL,
+                         headers={**cls.HEADERS,
+                                  'Accept': 'application/json'},
+                         timeout=15)
+        if r.status_code != 200:
+            raise RuntimeError(f"TPEX HTTP {r.status_code}")
+        arr = r.json()
+        if not isinstance(arr, list) or not arr:
+            return []
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        s = arr[0]
+        k_code = cls._resolve_key(s, "SecuritiesCompanyCode", "Code", "代號")
+        k_name = cls._resolve_key(s, "CompanyName", "Name", "名稱")
+        k_period = cls._resolve_key(s, "DispositionPeriod", "DisposalPeriod",
+                                    "Period", "起訖", "期間")
+        k_pub = cls._resolve_key(s, "Date", "公布", "日期")
+        k_cond = cls._resolve_key(s, "Condition", "Criteria", "Reason", "條件")
+        k_meas = cls._resolve_key(s, "DispositionMeasure", "Disposition",
+                                  "Measure", "措施")
+        if not (k_code and k_period):
+            raise RuntimeError(f"TPEX 欄位無法辨識: {list(s.keys())}")
+        seen = {}
+        for item in arr:
+            code = str(item.get(k_code, "")).strip()
+            if not cls._is_common_stock(code):
+                continue
+            ds, de = cls._parse_period(item.get(k_period, ""))
+            rec = {
+                "code": code,
+                "name": str(item.get(k_name, "")).strip(),
+                "publish_date": cls._roc_any_to_western(
+                    item.get(k_pub, "")) or "",
+                "disposal_start": ds or "", "disposal_end": de or "",
+                "condition": str(item.get(k_cond, "")).strip(),
+                "measure": str(item.get(k_meas, "")).strip(),
+                "is_active": bool(ds and de and ds <= today_str <= de),
+                "market": "TWO",
+            }
+            if code not in seen or rec["disposal_start"] > seen[code]["disposal_start"]:
+                seen[code] = rec
+        return list(seen.values())
+
     @classmethod
     def fetch_disposal_list(cls, days_back: int = 30) -> list:
-        """主要 API 失敗自動切 OpenAPI 備援, 兩個都失敗才回空 + 錯誤訊息"""
+        """上市 (主要API+OpenAPI備援) + 上櫃 (TPEX OpenAPI) 全部處置股"""
         cls._last_error = ""
-        err1 = err2 = ""
+        err1 = err2 = err3 = ""
+        twse_recs = []
         try:
-            recs = cls._fetch_via_website(days_back)
-            if recs:
-                return recs
-            err1 = "回傳 0 筆"
+            twse_recs = cls._fetch_via_website(days_back)
+            if not twse_recs:
+                err1 = "回傳 0 筆"
         except Exception as e:
             err1 = str(e)
+        if not twse_recs:
+            try:
+                twse_recs = cls._fetch_via_openapi()
+            except Exception as e:
+                err2 = str(e)
+        for r in twse_recs:
+            r.setdefault("market", "TW")
+        # 上櫃 (失敗不影響上市結果)
+        tpex_recs = []
         try:
-            recs = cls._fetch_via_openapi()
-            if recs:
-                return recs
-            err2 = "回傳 0 筆"
+            tpex_recs = cls._fetch_tpex_disposal()
         except Exception as e:
-            err2 = str(e)
-        cls._last_error = (f"主要API(www.twse): {err1}  |  "
-                           f"備援OpenAPI: {err2}")
+            err3 = str(e)
+        all_recs = twse_recs + tpex_recs
+        if all_recs:
+            if err3:
+                cls._last_error = f"⚠️ 上櫃處置抓取失敗(僅顯示上市): {err3}"
+            return all_recs
+        cls._last_error = (f"上市主API: {err1}  |  上市OpenAPI: {err2}  |  "
+                           f"上櫃: {err3}")
         return []
 
 
 def check_disposal_ma20(code, name, disposal):
-    ticker = f"{code}.TW"
+    ticker = f"{code}.{disposal.get('market', 'TW')}"
     df = StockDataFetcher.fetch_history(ticker, period="3mo")
     if df.empty or len(df) < 20:
         return None

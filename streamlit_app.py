@@ -24,15 +24,14 @@ from datetime import datetime
 
 # ---- 全市場資料載入 (快取: 同一天同參數只抓一次) ----
 @st.cache_data(show_spinner=False, ttl=6 * 3600, max_entries=3)
-def load_market_data(period: str, date_key: str, min_lots: int,
-                     _pcb=None):
-    stocks, data_date = FullMarketFetcher.fetch_stock_list(
-        min_today_lots=min_lots)
+def load_market_data(period: str, date_key: str, _pcb=None):
+    # ★ v4: min_today_lots=0 完全不預過濾, 上市+上櫃全掃, 零漏網之魚
+    stocks, data_date = FullMarketFetcher.fetch_stock_list(min_today_lots=0)
     if not stocks:
         return {}, {}, None
-    codes = [s["code"] for s in stocks]
-    names = {s["code"]: s["name"] for s in stocks}
-    frames = FullMarketFetcher.batch_download(codes, period=period,
+    names = {f"{s['code']}.{s.get('market', 'TW')}": s["name"]
+             for s in stocks}
+    frames = FullMarketFetcher.batch_download(stocks, period=period,
                                               progress_cb=_pcb)
     return frames, names, data_date
 
@@ -115,7 +114,7 @@ def plot_candlestick(ticker: str, name: str, note: str = "",
         except Exception:
             pass
 
-    code = ticker.replace(".TW", "")
+    code = ticker.rsplit(".", 1)[0]
     fig.update_layout(
         title=f"{name} ({code})  {note}",
         xaxis_rangeslider_visible=False, height=560,
@@ -208,8 +207,8 @@ if page == PAGE_SCREENER:
     desc = {v[0]: v[2] for v in STRATEGY_LEVELS}[level]
     st.caption(f"💡 {desc}")
 
-    st.caption("🌐 掃描範圍: 全市場上市普通股 (~900 檔)  |  "
-               "首次約 2~4 分鐘, 同日再掃只需幾秒 (當日快取)")
+    st.caption("🌐 掃描範圍: 上市+上櫃全部普通股 (~1800 檔, 零預過濾)  |  "
+               "首次約 3~6 分鐘, 同日再掃只需幾秒 (當日快取)")
     if level == "strict":
         st.warning("⚠️ Strict 要抓 2 年資料, 首次會比較久 (~5 分鐘)")
 
@@ -218,16 +217,14 @@ if page == PAGE_SCREENER:
         prog = st.progress(0, text="準備中...")
         if True:
             # 全市場: Stage1 清單 → Stage2 批次下載 (快取) → Stage3 本地掃描
-            p_now = StrategyParams.get()
-            pre_lots = max(100, int(p_now["min_vol_lots"]) // 3)
             period = "2y" if level == "strict" else "6mo"
             date_key = datetime.now().strftime("%Y-%m-%d")
-            prog.progress(0.02, text="Stage 1/3: 抓全市場股票清單...")
+            prog.progress(0.02, text="Stage 1/3: 抓上市+上櫃全部股票清單...")
             def _dl_cb(i, total, label):
                 prog.progress(0.05 + 0.55 * i / max(total, 1),
                               text=f"Stage 2/3: {label}")
             frames, names, data_date = load_market_data(
-                period, date_key, pre_lots, _pcb=_dl_cb)
+                period, date_key, _pcb=_dl_cb)
             if not frames:
                 st.error(f"抓取全市場清單失敗: "
                          f"{FullMarketFetcher.get_last_error()}")
@@ -244,13 +241,14 @@ if page == PAGE_SCREENER:
     hits = st.session_state.get("screener_hits", [])
     if hits:
         mi = st.session_state.get("market_info")
-        extra = f"  |  全市場掃了 {mi[0]} 檔 (資料日 {mi[1]})" if mi else ""
+        extra = (f"  |  上市+上櫃共掃 {mi[0]} 檔 (資料日 {mi[1]})"
+                 if mi else "")
         st.success(f"✅ 找到 {len(hits)} 檔{extra}")
         # ------- 左表右圖 -------
         col_l, col_r = st.columns([2, 3])
         with col_l:
             tbl = pd.DataFrame([{
-                "代碼": h["ticker"].replace(".TW", ""),
+                "代碼": h["ticker"].rsplit(".", 1)[0],
                 "名稱": h["name"],
                 "收盤": h["close"],
                 "量比": h["vol_ratio"],
@@ -300,6 +298,7 @@ else:
                 return dstr[5:].replace("-", "/") if dstr else "?"
             tbl = pd.DataFrame([{
                 "": r["color"], "代碼": r["code"], "名稱": r["name"],
+                "市場": "櫃" if r["disposal"].get("market") == "TWO" else "市",
                 "現價": r["close"],
                 "距月線%": r["diff_pct"],
                 "處置期間": f"{_short(r['disposal']['disposal_start'])}"
@@ -318,7 +317,7 @@ else:
             r = results[idx]
             d = r["disposal"]
             plot_candlestick(
-                f"{r['code']}.TW", r["name"],
+                f"{r['code']}.{r['disposal'].get('market', 'TW')}", r["name"],
                 note=f"距月線 {r['diff_pct']:+.1f}%",
                 ma20_only=True, disposal=d)
             st.caption(f"🚨 處置 {d['disposal_start']} ~ {d['disposal_end']}  "
